@@ -1,318 +1,549 @@
-#include <iostream>
-  #include <cstdlib>
-  #include <string>
-  #include <cstring>
-  #include <unistd.h>
-  #include <sys/types.h>
+// CrazyRedis -- a small educational Redis-compatible server.
+//
+// Speaks a real RESP parser (not fixed-index string splitting), is
+// thread-safe, supports lazy key expiry, a bounded LRU key store, and
+// basic master/replica replication. Builds on POSIX (Linux/macOS/WSL)
+// and Windows (MinGW-w64 / MSVC via Winsock2).
+
+#ifdef _WIN32
+  #define WIN32_LEAN_AND_MEAN
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #pragma comment(lib, "ws2_32.lib")
+  using socket_t = SOCKET;
+  static constexpr socket_t kInvalidSocket = INVALID_SOCKET;
+  static void closeSocket(socket_t s) { closesocket(s); }
+#else
   #include <sys/socket.h>
+  #include <netinet/in.h>
+  #include <netinet/tcp.h>
   #include <arpa/inet.h>
   #include <netdb.h>
-  #include <thread>
-  #include <vector>
-  #include <map>
-  #include <chrono>
-  #include <fstream>
-  #include <iomanip>  
-  #include <sstream>
-  // DEFAULT ROLE
-  std::string ROLE("role:master");
-  std::string master_host = "";
-  int master_port = -1;
-  std::string master_replid="8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
-  int master_repl_offset=0;
-  uint16_t port = 6379;
-  std::vector<int> replicaSocketFD;
-  const std::string empty_rdb = "\x52\x45\x44\x49\x53\x30\x30\x31\x31\xfa\x09\x72\x65\x64\x69\x73\x2d\x76\x65\x72\x05\x37\x2e\x32\x2e\x30\xfa\x0a\x72\x65\x64\x69\x73\x2d\x62\x69\x74\x73\xc0\x40\xfa\x05\x63\x74\x69\x6d\x65\xc2\x6d\x08\xbc\x65\xfa\x08\x75\x73\x65\x64\x2d\x6d\x65\x6d\xc2\xb0\xc4\x10\x00\xfa\x08\x61\x6f\x66\x2d\x62\x61\x73\x65\xc0\x00\xff\xf0\x6e\x3b\xfe\xc0\xff\x5a\xa2";
-  std::map<std::string, std::string> data;
-  std::string dir;
-  std::string dbfilename;
-  std::vector<std::string> splitMultipleRedisCommands(std::string input) {
-      std::vector<std::string> commands;
-      size_t pos = 0;
-      while ((pos = input.find("*")) != std::string::npos) {
-          size_t nextPos = input.find("*", pos + 1);
-          if (nextPos == std::string::npos) {
-              commands.push_back(input.substr(pos));
-              break;
-          } else {
-              commands.push_back(input.substr(pos, nextPos - pos));
-              input.erase(0, nextPos);
-          }
-      }
-      return commands;
+  #include <unistd.h>
+  using socket_t = int;
+  static constexpr socket_t kInvalidSocket = -1;
+  static void closeSocket(socket_t s) { close(s); }
+#endif
+
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <list>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
+
+using Clock = std::chrono::steady_clock;
+
+// ---------------------------------------------------------------------------
+// Small cross-platform networking shims
+// ---------------------------------------------------------------------------
+
+static bool networkInit() {
+#ifdef _WIN32
+  WSADATA wsaData;
+  return WSAStartup(MAKEWORD(2, 2), &wsaData) == 0;
+#else
+  return true;
+#endif
+}
+
+static void networkCleanup() {
+#ifdef _WIN32
+  WSACleanup();
+#endif
+}
+
+static ssize_t socketSend(socket_t fd, const std::string &data) {
+  return send(fd, data.data(), static_cast<int>(data.size()), 0);
+}
+
+static ssize_t socketRecv(socket_t fd, char *buf, size_t len) {
+  return recv(fd, buf, static_cast<int>(len), 0);
+}
+
+// Connects to host:port using getaddrinfo, which works identically on
+// POSIX and Windows and (unlike the previous implementation) actually
+// resolves and dials the requested host instead of INADDR_ANY.
+static socket_t connectTo(const std::string &host, int port) {
+  struct addrinfo hints {};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+
+  struct addrinfo *res = nullptr;
+  std::string portStr = std::to_string(port);
+  if (getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res) != 0 || !res) {
+    return kInvalidSocket;
   }
-  std::vector<std::string> splitRedisCommand(std::string input, std::string separator, int separatorLength ) {
-    std::size_t foundSeparator = input.find(separator);
-    std::vector<std::string> result;
-    if (foundSeparator == std::string::npos) {
-        result.push_back(input);
+
+  socket_t fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if (fd == kInvalidSocket) {
+    freeaddrinfo(res);
+    return kInvalidSocket;
+  }
+
+  if (connect(fd, res->ai_addr, static_cast<int>(res->ai_addrlen)) != 0) {
+    closeSocket(fd);
+    freeaddrinfo(res);
+    return kInvalidSocket;
+  }
+
+  freeaddrinfo(res);
+  return fd;
+}
+
+// ---------------------------------------------------------------------------
+// RESP protocol helpers
+// ---------------------------------------------------------------------------
+
+static std::string toLower(const std::string &s) {
+  std::string out(s);
+  std::transform(out.begin(), out.end(), out.begin(),
+                  [](unsigned char c) { return std::tolower(c); });
+  return out;
+}
+
+static std::string respSimpleString(const std::string &s) { return "+" + s + "\r\n"; }
+static std::string respError(const std::string &s) { return "-ERR " + s + "\r\n"; }
+static std::string respNilBulkString() { return "$-1\r\n"; }
+static std::string respBulkString(const std::string &s) {
+  return "$" + std::to_string(s.size()) + "\r\n" + s + "\r\n";
+}
+static std::string respArray(const std::vector<std::string> &items) {
+  std::string out = "*" + std::to_string(items.size()) + "\r\n";
+  for (const auto &item : items) out += respBulkString(item);
+  return out;
+}
+static std::string respCommandArray(const std::vector<std::string> &args) {
+  return respArray(args);
+}
+
+// Parses a single RESP array-of-bulk-strings command from the front of
+// `buffer`. Returns the parsed args and erases the consumed bytes from
+// `buffer` on success. Returns std::nullopt if the buffer doesn't yet
+// contain a full command (the caller should wait for more bytes).
+static std::optional<std::vector<std::string>> parseRespCommand(std::string &buffer) {
+  if (buffer.empty()) return std::nullopt;
+
+  size_t pos = 0;
+  if (buffer[pos] != '*') return std::nullopt;
+
+  size_t lineEnd = buffer.find("\r\n", pos);
+  if (lineEnd == std::string::npos) return std::nullopt;
+
+  int argCount = 0;
+  try {
+    argCount = std::stoi(buffer.substr(pos + 1, lineEnd - pos - 1));
+  } catch (...) {
+    buffer.clear();
+    return std::nullopt;
+  }
+  pos = lineEnd + 2;
+
+  std::vector<std::string> args;
+  args.reserve(std::max(argCount, 0));
+
+  for (int i = 0; i < argCount; ++i) {
+    if (pos >= buffer.size() || buffer[pos] != '$') return std::nullopt;
+
+    size_t lenLineEnd = buffer.find("\r\n", pos);
+    if (lenLineEnd == std::string::npos) return std::nullopt;
+
+    int len = 0;
+    try {
+      len = std::stoi(buffer.substr(pos + 1, lenLineEnd - pos - 1));
+    } catch (...) {
+      buffer.clear();
+      return std::nullopt;
     }
-    while (foundSeparator != std::string::npos) {
-        std::string splitOccurrence = input.substr(0, foundSeparator);
-        result.push_back(splitOccurrence);
-        input = input.substr(foundSeparator + separatorLength, input.length()-foundSeparator+separatorLength);
-        foundSeparator = input.find(separator);
+    size_t dataStart = lenLineEnd + 2;
+    size_t dataEnd = dataStart + len;
+    if (dataEnd + 2 > buffer.size()) return std::nullopt;  // need more bytes
+
+    args.push_back(buffer.substr(dataStart, len));
+    pos = dataEnd + 2;
+  }
+
+  buffer.erase(0, pos);
+  return args;
+}
+
+// ---------------------------------------------------------------------------
+// Bounded, thread-safe LRU key/value store with lazy expiry
+// ---------------------------------------------------------------------------
+
+class LruStore {
+ public:
+  explicit LruStore(size_t capacity) : capacity_(capacity) {}
+
+  void set(const std::string &key, const std::string &value,
+           std::optional<int64_t> ttlMillis) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::optional<Clock::time_point> expiresAt;
+    if (ttlMillis) expiresAt = Clock::now() + std::chrono::milliseconds(*ttlMillis);
+
+    auto it = index_.find(key);
+    if (it != index_.end()) {
+      it->second->value = value;
+      it->second->expiresAt = expiresAt;
+      touch(it->second);
+      return;
+    }
+
+    if (index_.size() >= capacity_) evictLru();
+
+    order_.push_front(Entry{key, value, expiresAt});
+    index_[key] = order_.begin();
+  }
+
+  std::optional<std::string> get(const std::string &key) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = index_.find(key);
+    if (it == index_.end()) return std::nullopt;
+    if (isExpired(it->second)) {
+      order_.erase(it->second);
+      index_.erase(it);
+      return std::nullopt;
+    }
+    touch(it->second);
+    return it->second->value;
+  }
+
+  bool remove(const std::string &key) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = index_.find(key);
+    if (it == index_.end()) return false;
+    order_.erase(it->second);
+    index_.erase(it);
+    return true;
+  }
+
+  std::vector<std::string> keys() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::string> result;
+    result.reserve(index_.size());
+    for (auto it = order_.begin(); it != order_.end(); ++it) {
+      if (!isExpired(it)) result.push_back(it->key);
     }
     return result;
   }
-  void start_expiry(std::map<std::string, std::string> &data_map, std::string key, int millis) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(millis));
-    data_map.erase(key);
-  }
-  void command_propagate(std::string command){
-    std::cout << "propagate test";
-    for (int replicaFD : replicaSocketFD)
-    {
-      send(replicaFD, command.c_str(), command.size(), 0);
-    }
-  }
-  void handle_client(int client_fd){
-    while(true){
-      char buffer[1024]={0};
-      memset(buffer, 0, sizeof(buffer));
-      ssize_t bytes_read = read(client_fd, buffer, sizeof(buffer) - 1);
-      if (bytes_read <= 0) {
-          std::cerr << "Client disconnected or read error\n";
-          break;
-      }
-      std::string str(buffer, strlen(buffer)); 
-      std::cout << "Received from client: " << str.c_str() << std::endl;
-      std::vector<std::string> commands = splitMultipleRedisCommands(str);
-      for ( auto command:commands){
-        for (const auto& pair : data) {
-            std::cout << "Key: " << pair.first << ", Value: " << pair.second << std::endl;
-        }
-        std::vector<std::string> tokens = splitRedisCommand(command, "\r\n", 2);
-        // for (const std::string& token: tokens) {
-        //     std::cout << "***" << token << "***" << std::endl;
-        // }
-        // Lowercase command
-        std::string lCommand = "";
-        for(auto c : tokens[2]) {
-            lCommand += tolower(c);
-        }
-        std::string return_msg;
-        if (lCommand == "ping")
-        {
-          return_msg = "+PONG\r\n";
-          std::cout << "+" << return_msg << "+" << std::endl;
-        }
-        else if (lCommand == "echo")
-        {
-          return_msg = tokens[3] + "\r\n" + tokens[4] + "\r\n";
-          std::cout << "+" << return_msg << "+" << std::endl;
-        }
-        else if (lCommand == "get")
-        { 
-          
-          if (data[tokens[4]].empty()) {
-            std::string response = "$-1\r\n";
-            if (tokens[4] == "foo"){
-              response = "$3\r\n123\r\n";
-            }else if(tokens[4] == "bar"){
-              response = "$3\r\n456\r\n";
-            }else if (tokens[4] == "baz"){
-              response = "$3\r\n789\r\n";
-            }
-            // if (tokens[4] == "foo"){
-            //   response = "$3\r\n123\r\n";
-            // }else if(tokens[4] == "bar"){
-            //   response = "$3\r\n456\r\n";
-            // }else if (tokens[4] == "baz"){
-            //   response = "$3\r\n789\r\n";
-            // }
-            return_msg = (char *)response.c_str();
-          } else {
-            auto value = data[tokens[4]];
-            std::string response = "$" + std::to_string(value.size()) + "\r\n" + value + "\r\n";
-            return_msg = (char *)response.c_str();
-          }
-        }
-        else if (lCommand == "set")
-        {
-          data[tokens[4]] = tokens[6];
-          return_msg = (char*)"+OK\r\n";
-          if (tokens.size() == 11){
-            int millis = std::stoi(tokens[10]);
-            std::string key = tokens[4];
-            std::thread t(start_expiry, std::ref(data), key, millis);
-            t.detach();
-          }
-          //Command propagation
-          if (master_port == -1){
-            std::string command = "*3\r\n$3\r\nSET\r\n";
-            command += "$" + std::to_string(tokens[4].size()) + "\r\n" + tokens[4] + "\r\n";
-            command += "$" + std::to_string(tokens[6].size()) + "\r\n" + tokens[6] + "\r\n";
-            command_propagate(command);
-          }
-        }
-        else if (lCommand == "info" && tokens[4]=="replication"){
-          std::string info = ROLE +"\n"+"master_replid:"+master_replid+"\n";
-          info = info + "master_repl_offset:"+ std::to_string(master_repl_offset)+"\n";
-          return_msg = "$"+std::to_string(info.size())+"\r\n"+info+"\r\n";
-        }else if (lCommand == "replconf"){
-          
-          return_msg = (char*)"+OK\r\n";
-          if (tokens[4]=="listening-port"){
-            replicaSocketFD.push_back(client_fd);
-          }
-          else if (tokens[4] == "capa")
-          {
-          }
-        }else if (lCommand == "psync"){
-          return_msg = "+FULLRESYNC ";
-          return_msg += master_replid +" ";
-          return_msg += std::to_string(master_repl_offset) + "\r\n";
-          return_msg += "$" + std::to_string(empty_rdb.length()) + "\r\n" + empty_rdb;
-        }else if (lCommand == "config"){
-          return_msg = "*2\r\n";
-          if (tokens[6] == "dir"){
-            return_msg += "$3\r\ndir\r\n";
-            return_msg += "$" + std::to_string(dir.size()) + "\r\n" + dir + "\r\n";
-          }
-          else
-          {
-            return_msg += "$10\r\ndbfilename\r\n";
-            return_msg += "$" + std::to_string(dbfilename.size()) + "\r\n" + dbfilename + "\r\n";
-          }
-        }
-        send(client_fd, return_msg.data(), return_msg.length(), 0);
+
+  // Sweeps expired keys. Safe to call periodically from a background thread.
+  void reapExpired() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto it = order_.begin(); it != order_.end();) {
+      if (isExpired(it)) {
+        auto toErase = it++;
+        index_.erase(toErase->key);
+        order_.erase(toErase);
+      } else {
+        ++it;
       }
     }
-    close(client_fd);
   }
-  void sendHandshake(){
-    int replica_fd = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in master_addr;
-    master_addr.sin_family = AF_INET;
-    master_addr.sin_port = htons(master_port);
-    master_addr.sin_addr.s_addr = INADDR_ANY; 
-    if(connect(replica_fd, (struct sockaddr *) &master_addr, sizeof(master_addr)) == -1) 
-    {
-      std::cerr << "Replica failed to connect to master\n";
-    }
-    char buf[1024] = {'\0'};
-    std::string ping{"*1\r\n$4\r\nping\r\n"};
-    send(replica_fd, ping.c_str(), ping.size(), 0);
-    recv(replica_fd, buf, sizeof(buf), 0);
-    std::string replconf{"*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n"};
-    replconf = replconf + std::to_string(port) + "\r\n";
-    send(replica_fd, replconf.c_str(), replconf.size(), 0);
-    recv(replica_fd, buf, sizeof(buf), 0);
-    std::string capa{"*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"};
-    send(replica_fd, capa.c_str(), capa.size(), 0);
-    recv(replica_fd, buf, sizeof(buf), 0);
-    std::string psync{"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"};
-    send(replica_fd, psync.c_str(), psync.size(), 0);
-    recv(replica_fd, buf, sizeof(buf), 0);
+
+ private:
+  struct Entry {
+    std::string key;
+    std::string value;
+    std::optional<Clock::time_point> expiresAt;
+  };
+  using Iter = std::list<Entry>::iterator;
+
+  bool isExpired(const Iter &it) const {
+    return it->expiresAt.has_value() && Clock::now() >= *it->expiresAt;
   }
-  void load_rdb_file(const std::string& rdb_file_path, std::map<std::string, std::string>& data) {
-    std::ifstream rdb_file(rdb_file_path, std::ios::binary);
-    if (!rdb_file) {
-        std::cerr << "RDB file not found or could not be opened: " << rdb_file_path << "\n";
-        return;
-    }
 
-    // Basic RDB parsing (you may need to enhance this for a full parser)
-    // For simplicity, assuming the file contains one key-value pair, ignoring other metadata.
-    std::string key = "foo";  // Example: extract this from RDB format
-    std::string value = "123"; // Example value
+  void touch(Iter &it) {
+    order_.splice(order_.begin(), order_, it);
+  }
 
-    // Load into the in-memory database
-    data[key] = value;
+  void evictLru() {
+    if (order_.empty()) return;
+    index_.erase(order_.back().key);
+    order_.pop_back();
+  }
 
-    rdb_file.close();
+  size_t capacity_;
+  std::mutex mutex_;
+  std::list<Entry> order_;  // front = most recently used
+  std::unordered_map<std::string, Iter> index_;
+};
+
+// ---------------------------------------------------------------------------
+// Server state
+// ---------------------------------------------------------------------------
+
+struct ServerState {
+  uint16_t port = 6379;
+  std::string role = "role:master";
+  std::string masterHost;
+  int masterPort = -1;
+  std::string masterReplId = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+  int masterReplOffset = 0;
+  std::string dir;
+  std::string dbfilename;
+
+  LruStore store{10000};  // default LRU capacity: 10k keys
+
+  std::mutex replicaMutex;
+  std::vector<socket_t> replicas;
+
+  bool isMaster() const { return masterPort == -1; }
+};
+
+static ServerState g;
+
+// A tiny, best-effort RDB reader: it only checks the file exists and is
+// readable. Full RDB decoding is out of scope for this project, so the
+// server intentionally starts with an empty dataset rather than
+// fabricating data (as the previous implementation did).
+static void loadRdbFile(const std::string &path) {
+  std::ifstream rdb(path, std::ios::binary);
+  if (!rdb) {
+    std::cerr << "[rdb] no existing dump at " << path << ", starting empty\n";
+    return;
+  }
+  std::cerr << "[rdb] found dump at " << path
+            << " (full RDB parsing not implemented; starting empty)\n";
 }
 
-// Function to handle KEYS command
-std::string handle_keys_command(const std::map<std::string, std::string>& data) {
-    std::string response = "*" + std::to_string(data.size()) + "\r\n";
-    for (const auto& pair : data) {
-        response += "$" + std::to_string(pair.first.size()) + "\r\n" + pair.first + "\r\n";
-    }
-    return response;
+const std::string kEmptyRdb =
+    "\x52\x45\x44\x49\x53\x30\x30\x31\x31\xfa\x09\x72\x65\x64\x69\x73\x2d\x76"
+    "\x65\x72\x05\x37\x2e\x32\x2e\x30\xfa\x0a\x72\x65\x64\x69\x73\x2d\x62\x69"
+    "\x74\x73\xc0\x40\xfa\x05\x63\x74\x69\x6d\x65\xc2\x6d\x08\xbc\x65\xfa\x08"
+    "\x75\x73\x65\x64\x2d\x6d\x65\x6d\xc2\xb0\xc4\x10\x00\xfa\x08\x61\x6f\x66"
+    "\x2d\x62\x61\x73\x65\xc0\x00\xff\xf0\x6e\x3b\xfe\xc0\xff\x5a\xa2";
+
+static void propagateToReplicas(const std::vector<std::string> &args) {
+  std::lock_guard<std::mutex> lock(g.replicaMutex);
+  if (g.replicas.empty()) return;
+  std::string encoded = respCommandArray(args);
+  for (socket_t fd : g.replicas) socketSend(fd, encoded);
 }
 
+// ---------------------------------------------------------------------------
+// Command dispatch
+// ---------------------------------------------------------------------------
 
+static std::string handleCommand(const std::vector<std::string> &args, socket_t clientFd) {
+  if (args.empty()) return "";
+  std::string cmd = toLower(args[0]);
 
-  int main(int argc, char **argv) {
-
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    std::cout << "Logs from your program will appear here!\n";
-    // Uncomment this block to pass the first stage
-    //
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-     std::cerr << "Failed to create server socket\n";
-     return 1;
-    }
-    for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--dir") == 0) {
-            dir = argv[++i];
-        }
-        if (strcmp(argv[i], "--dbfilename") == 0) {
-            dbfilename = argv[++i];
-        }
-    }
-
-    std::string rdb_file_path = dir + "/" + dbfilename;
-    
-    // Load the RDB file (if it exists)
-    load_rdb_file(rdb_file_path, data);
-
-    // Since the tester restarts your program quite often, setting SO_REUSEADDR
-    // ensures that we don't run into 'Address already in use' errors
-    int reuse = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
-      std::cerr << "setsockopt failed\n";
-      return 1;
-    }
-    for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "--port")==0) {
-          port = std::stoi(argv[++i]);
-        }
-        
-        if (strcmp(argv[i], "--replicaof")==0){
-          ROLE = "role:slave";
-          std::string master = argv[++i];
-          master_host = master.substr(0, master.find(" "));
-          master_port = std::stoi(master.substr(master.find(" ") + 1));
-          sendHandshake();
-        }
-        if (strcmp(argv[i], "--dir")==0){
-          dir = argv[++i];
-        }
-        if (strcmp(argv[i], "--dbfilename")==0){
-          dbfilename = argv[++i];
-        }
-    }
-    
-    struct sockaddr_in server_addr;
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(port);
-    
-    if (bind(server_fd, (struct sockaddr *) &server_addr, sizeof(server_addr)) != 0) {
-      std::cerr << "Failed to bind to port 6379\n";
-      return 1;
-    }
-    
-    int connection_backlog = 5;
-    if (listen(server_fd, connection_backlog) != 0) {
-      std::cerr << "listen failed\n";
-      return 1;
-    }
-    
-    struct sockaddr_in client_addr;
-    int client_addr_len = sizeof(client_addr);
-    
-    std::cout << "Waiting for a client to connect...\n";
-    while (true){
-      int client_fd = accept(server_fd, (struct sockaddr *) &client_addr, (socklen_t *) &client_addr_len);
-      std::cout << "Client connected\n";
-      std::thread nw(handle_client,client_fd);
-      nw.detach();
-    }
-    close(server_fd);
-    return 0;
+  if (cmd == "ping") {
+    return respSimpleString("PONG");
   }
+
+  if (cmd == "echo") {
+    if (args.size() < 2) return respError("wrong number of arguments for 'echo'");
+    return respBulkString(args[1]);
+  }
+
+  if (cmd == "set") {
+    if (args.size() < 3) return respError("wrong number of arguments for 'set'");
+    std::optional<int64_t> ttlMillis;
+    for (size_t i = 3; i + 1 < args.size(); i += 2) {
+      std::string opt = toLower(args[i]);
+      if (opt == "px") {
+        ttlMillis = std::stoll(args[i + 1]);
+      } else if (opt == "ex") {
+        ttlMillis = std::stoll(args[i + 1]) * 1000;
+      }
+    }
+    g.store.set(args[1], args[2], ttlMillis);
+    if (g.isMaster()) propagateToReplicas(args);
+    return respSimpleString("OK");
+  }
+
+  if (cmd == "get") {
+    if (args.size() < 2) return respError("wrong number of arguments for 'get'");
+    auto value = g.store.get(args[1]);
+    return value ? respBulkString(*value) : respNilBulkString();
+  }
+
+  if (cmd == "del") {
+    if (args.size() < 2) return respError("wrong number of arguments for 'del'");
+    int removed = 0;
+    for (size_t i = 1; i < args.size(); ++i) {
+      if (g.store.remove(args[i])) ++removed;
+    }
+    if (g.isMaster()) propagateToReplicas(args);
+    return ":" + std::to_string(removed) + "\r\n";
+  }
+
+  if (cmd == "keys") {
+    return respArray(g.store.keys());
+  }
+
+  if (cmd == "info" && args.size() >= 2 && toLower(args[1]) == "replication") {
+    std::string info = g.role + "\n" + "master_replid:" + g.masterReplId + "\n" +
+                        "master_repl_offset:" + std::to_string(g.masterReplOffset) + "\n";
+    return respBulkString(info);
+  }
+
+  if (cmd == "replconf") {
+    if (args.size() >= 2 && toLower(args[1]) == "listening-port") {
+      std::lock_guard<std::mutex> lock(g.replicaMutex);
+      g.replicas.push_back(clientFd);
+    }
+    return respSimpleString("OK");
+  }
+
+  if (cmd == "psync") {
+    std::string reply = "+FULLRESYNC " + g.masterReplId + " " +
+                         std::to_string(g.masterReplOffset) + "\r\n";
+    reply += "$" + std::to_string(kEmptyRdb.size()) + "\r\n" + kEmptyRdb;
+    return reply;
+  }
+
+  if (cmd == "config" && args.size() >= 3 && toLower(args[1]) == "get") {
+    std::string param = toLower(args[2]);
+    if (param == "dir") return respArray({"dir", g.dir});
+    if (param == "dbfilename") return respArray({"dbfilename", g.dbfilename});
+    return respArray({});
+  }
+
+  return respError("unknown command '" + args[0] + "'");
+}
+
+// ---------------------------------------------------------------------------
+// Connection handling
+// ---------------------------------------------------------------------------
+
+static void handleClient(socket_t clientFd) {
+  std::string inbox;
+  char buf[4096];
+
+  while (true) {
+    ssize_t n = socketRecv(clientFd, buf, sizeof(buf));
+    if (n <= 0) break;
+    inbox.append(buf, static_cast<size_t>(n));
+
+    while (auto args = parseRespCommand(inbox)) {
+      std::string reply = handleCommand(*args, clientFd);
+      if (!reply.empty()) socketSend(clientFd, reply);
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(g.replicaMutex);
+    g.replicas.erase(std::remove(g.replicas.begin(), g.replicas.end(), clientFd),
+                      g.replicas.end());
+  }
+  closeSocket(clientFd);
+}
+
+static void expiryReaperLoop() {
+  while (true) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    g.store.reapExpired();
+  }
+}
+
+static void sendHandshake() {
+  socket_t fd = connectTo(g.masterHost, g.masterPort);
+  if (fd == kInvalidSocket) {
+    std::cerr << "Replica failed to connect to master " << g.masterHost << ":" << g.masterPort
+               << "\n";
+    return;
+  }
+
+  char buf[1024];
+  socketSend(fd, respCommandArray({"ping"}));
+  socketRecv(fd, buf, sizeof(buf));
+
+  socketSend(fd, respCommandArray({"REPLCONF", "listening-port", std::to_string(g.port)}));
+  socketRecv(fd, buf, sizeof(buf));
+
+  socketSend(fd, respCommandArray({"REPLCONF", "capa", "psync2"}));
+  socketRecv(fd, buf, sizeof(buf));
+
+  socketSend(fd, respCommandArray({"PSYNC", "?", "-1"}));
+  socketRecv(fd, buf, sizeof(buf));
+
+  closeSocket(fd);
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+int main(int argc, char **argv) {
+  std::cout << "Logs from your program will appear here!\n";
+
+  if (!networkInit()) {
+    std::cerr << "Failed to initialize networking\n";
+    return 1;
+  }
+
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+      g.port = static_cast<uint16_t>(std::stoi(argv[++i]));
+    } else if (std::strcmp(argv[i], "--dir") == 0 && i + 1 < argc) {
+      g.dir = argv[++i];
+    } else if (std::strcmp(argv[i], "--dbfilename") == 0 && i + 1 < argc) {
+      g.dbfilename = argv[++i];
+    } else if (std::strcmp(argv[i], "--replicaof") == 0 && i + 1 < argc) {
+      g.role = "role:slave";
+      std::string master = argv[++i];
+      size_t spacePos = master.find(' ');
+      g.masterHost = master.substr(0, spacePos);
+      g.masterPort = std::stoi(master.substr(spacePos + 1));
+    }
+  }
+
+  if (!g.dir.empty() && !g.dbfilename.empty()) {
+    loadRdbFile(g.dir + "/" + g.dbfilename);
+  }
+
+  socket_t serverFd = socket(AF_INET, SOCK_STREAM, 0);
+  if (serverFd == kInvalidSocket) {
+    std::cerr << "Failed to create server socket\n";
+    return 1;
+  }
+
+  int reuse = 1;
+  setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&reuse),
+             sizeof(reuse));
+
+  struct sockaddr_in serverAddr {};
+  serverAddr.sin_family = AF_INET;
+  serverAddr.sin_addr.s_addr = INADDR_ANY;
+  serverAddr.sin_port = htons(g.port);
+
+  if (bind(serverFd, reinterpret_cast<struct sockaddr *>(&serverAddr), sizeof(serverAddr)) != 0) {
+    std::cerr << "Failed to bind to port " << g.port << "\n";
+    return 1;
+  }
+
+  if (listen(serverFd, 16) != 0) {
+    std::cerr << "listen failed\n";
+    return 1;
+  }
+
+  std::thread(expiryReaperLoop).detach();
+
+  if (!g.isMaster()) {
+    std::thread(sendHandshake).detach();
+  }
+
+  std::cout << "Waiting for a client to connect on port " << g.port << "...\n";
+  while (true) {
+    struct sockaddr_in clientAddr {};
+    socklen_t clientAddrLen = sizeof(clientAddr);
+    socket_t clientFd =
+        accept(serverFd, reinterpret_cast<struct sockaddr *>(&clientAddr), &clientAddrLen);
+    if (clientFd == kInvalidSocket) continue;
+    std::thread(handleClient, clientFd).detach();
+  }
+
+  closeSocket(serverFd);
+  networkCleanup();
+  return 0;
+}
